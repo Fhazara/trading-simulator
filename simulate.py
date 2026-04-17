@@ -16,13 +16,14 @@ What it does
 7. Generates a research-style PDF report to ./output/simulation_report.pdf.
 """
 
+import argparse
 import os
 import subprocess
 import sys
 
 # ── Auto-install dependencies ─────────────────────────────────────────────────
 
-_REQUIRED = ["yfinance", "pandas", "numpy", "matplotlib", "scipy", "reportlab"]
+_REQUIRED = ["yfinance", "pandas", "numpy", "matplotlib", "scipy", "reportlab", "plotly"]
 
 
 def _ensure_packages() -> None:
@@ -61,11 +62,13 @@ from simulation import TradingSimulation
 from metrics import all_metrics
 from visualization import generate_all
 from report import generate_report
+from dashboard import generate_dashboard
 from strategies import (
     MarketMakerStrategy,
     MomentumStrategy,
     MeanReversionStrategy,
     NoiseTraderStrategy,
+    TrendFollowerStrategy,
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -79,7 +82,7 @@ IMPACT_ETA      = 0.08        # market impact coefficient η
 def print_banner() -> None:
     print("=" * 65)
     print("  AAPL Algorithmic Trading Simulator")
-    print("  Multi-Agent Order Book  ·  4 Competing Strategies")
+    print("  Multi-Agent Order Book  ·  5 Competing Strategies")
     print("=" * 65)
 
 
@@ -105,6 +108,22 @@ def print_metrics(metrics_df: pd.DataFrame) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="AAPL Algorithmic Trading Simulator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        default=False,
+        help=(
+            "Run walk-forward out-of-sample backtesting after the main simulation. "
+            "Slides a 30-day IS window in 5-day OOS steps, evaluates all 5 strategies "
+            "on each OOS window, and embeds a Walk-Forward Analysis section into the PDF."
+        ),
+    )
+    args = parser.parse_args()
+
     t_start = time.time()
     print_banner()
 
@@ -169,6 +188,17 @@ def main() -> None:
             min_qty=20,
             max_qty=150,
         ),
+        TrendFollowerStrategy(
+            trader_id="TrendFollower",
+            initial_capital=INITIAL_CAPITAL,
+            max_position=600,
+            warmup=25,
+            channel_period=20,
+            atr_period=14,
+            atr_stop_mult=2.0,
+            atr_tp_mult=3.0,
+            risk_pct=0.01,
+        ),
     ]
 
     for s in strategies:
@@ -195,21 +225,44 @@ def main() -> None:
         depth_snapshot=sim.depth_snapshot,
     )
 
-    # ── 6. Generate PDF report ─────────────────────────────────────────────
+    # ── 6. Walk-forward analysis (optional) ───────────────────────────────────
+    wf_data = None
+    if args.walk_forward:
+        from walk_forward import run as wf_run
+        print("\n[WF] Starting walk-forward backtesting...")
+        wf_windows, wf_summary, wf_chart_paths = wf_run(data=data, verbose=True)
+        wf_data = {
+            "windows":     wf_windows,
+            "summary_df":  wf_summary,
+            "chart_paths": wf_chart_paths,
+        }
+
+    # ── 7. Generate PDF report ─────────────────────────────────────────────
     print("\n[Report] Building PDF report...")
     report_path = generate_report(
         strategies=strategies,
         chart_paths=chart_paths,
         price_history=sim.price_history,
         data_info=data_info,
+        wf_data=wf_data,
+    )
+
+    # ── 8. Generate interactive HTML dashboard ─────────────────────────────
+    print("\n[Dashboard] Building interactive HTML dashboard...")
+    dashboard_path = generate_dashboard(
+        strategies=strategies,
+        price_history=sim.price_history,
+        data=data,
     )
 
     # ── Done ──────────────────────────────────────────────────────────────
     elapsed = time.time() - t_start
     print("\n" + "=" * 65)
     print(f"  Simulation complete in {elapsed:.1f}s")
-    print(f"  Charts   → {os.path.join(ROOT, 'output')}/")
-    print(f"  Report   → {report_path}")
+    print(f"  Charts    → {os.path.join(ROOT, 'output')}/")
+    print(f"  Report    → {report_path}")
+    if dashboard_path:
+        print(f"  Dashboard → {dashboard_path}")
     print("=" * 65 + "\n")
 
 

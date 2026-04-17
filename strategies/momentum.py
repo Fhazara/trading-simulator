@@ -8,12 +8,20 @@ Logic
 • Long signal  : fast_ema > slow_ema × (1 + threshold)
 • Short signal : fast_ema < slow_ema × (1 − threshold)
 • Neutral      : otherwise (close out position)
-• Entries via marketable limit order (2 cents inside mid) to avoid
-  being swept at unfavourable prices.
-• Hard stop-loss at stop_loss_pct adverse excursion from average entry.
 
-All resting orders are cancelled-and-refreshed every bar to prevent
-stale limits from accumulating on the same signal across multiple bars.
+Regime gate (NEW)
+─────────────────
+• In TRENDING_UP   – only long entries are permitted.
+• In TRENDING_DOWN – only short entries are permitted.
+• In RANGING       – no new entries (EMA crossovers in choppy markets produce
+                     whipsaws); existing position is closed on neutral signal.
+• In UNKNOWN       – original behaviour (warming up).
+
+This prevents the strategy from going long into a sustained downtrend (the
+$280 → $244 AAPL move that caused −$10k losses in the original version).
+
+All resting orders are cancelled-and-refreshed every bar to prevent stale
+limits from accumulating on the same signal across multiple bars.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import pandas as pd
 
 from .base import BaseStrategy, OrderSpec
 from order_book import Side, OrderType
+from regime import RegimeDetector, Regime
 
 if TYPE_CHECKING:
     from order_book import LimitOrderBook
@@ -36,7 +45,7 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
 
 class MomentumStrategy(BaseStrategy):
     """
-    EMA-crossover trend-follower.
+    EMA-crossover trend-follower with ADX regime gate.
 
     Parameters
     ----------
@@ -48,6 +57,10 @@ class MomentumStrategy(BaseStrategy):
         Shares per entry signal.
     stop_loss_pct : float
         Close position if unrealised loss exceeds this fraction.
+    adx_period : int
+        ADX period for the internal regime detector.
+    trend_thresh : float
+        ADX level above which a trend is confirmed (default 25).
     """
 
     def __init__(
@@ -61,6 +74,8 @@ class MomentumStrategy(BaseStrategy):
         threshold: float = 0.0003,
         trade_size: int = 150,
         stop_loss_pct: float = 0.025,
+        adx_period: int = 14,
+        trend_thresh: float = 25.0,
     ) -> None:
         super().__init__(trader_id, initial_capital, max_position, warmup)
         self.fast_span     = fast_span
@@ -69,6 +84,10 @@ class MomentumStrategy(BaseStrategy):
         self.trade_size    = trade_size
         self.stop_loss_pct = stop_loss_pct
         self._entry_price: Optional[float] = None
+        self._regime_detector = RegimeDetector(
+            adx_period=adx_period,
+            trend_thresh=trend_thresh,
+        )
 
     def generate_orders(
         self,
@@ -91,6 +110,20 @@ class MomentumStrategy(BaseStrategy):
 
         long_signal  = fast > slow * (1.0 + self.threshold)
         short_signal = fast < slow * (1.0 - self.threshold)
+
+        # ── regime gate ──────────────────────────────────────────────
+        regime = self._regime_detector.detect(prices, step)
+
+        # In RANGING regime, suppress new entries (crossovers whipsaw).
+        # In TRENDING regimes, filter to the confirmed direction only.
+        if regime == Regime.RANGING:
+            long_signal  = False
+            short_signal = False
+        elif regime == Regime.TRENDING_UP:
+            short_signal = False   # don't short into an uptrend
+        elif regime == Regime.TRENDING_DOWN:
+            long_signal  = False   # don't long into a downtrend
+        # UNKNOWN: preserve both signals (warming up, use raw EMA)
 
         pos = int(round(self.position))
 

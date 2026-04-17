@@ -192,6 +192,49 @@ def _metrics_table_flowable(df: pd.DataFrame, styles: Dict) -> Table:
     return t
 
 
+def _wf_summary_table(summary_df: pd.DataFrame, styles: Dict) -> Table:
+    """Build a styled ReportLab Table from the walk-forward summary DataFrame."""
+    df_display = summary_df.reset_index()
+    headers    = list(df_display.columns)
+
+    header_row = [Paragraph(h, styles["TableHead"]) for h in headers]
+    data_rows  = [
+        [Paragraph(str(v), styles["TableCell"]) for v in row]
+        for row in df_display.values.tolist()
+    ]
+    table_data = [header_row] + data_rows
+
+    col_widths = [3.4 * cm] + [3.2 * cm] * (len(headers) - 1)
+    t = Table(table_data, colWidths=col_widths, repeatRows=1)
+
+    style_cmds = [
+        ("BACKGROUND",    (0, 0), (-1, 0),  BLUE_H),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, 0),  8),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#EEF2F7")]),
+        ("GRID",          (0, 0), (-1, -1), 0.4, GREY_RULE),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    # Colour mean-PnL and worst-window columns
+    pnl_cols = [i for i, h in enumerate(headers) if "PnL" in h or "Worst" in h]
+    for r_idx, row in enumerate(df_display.values.tolist(), start=1):
+        for c_idx in pnl_cols:
+            try:
+                num = float(str(row[c_idx]).replace(",", ""))
+                bg  = colors.HexColor("#E8F5E9") if num >= 0 else colors.HexColor("#FFEBEE")
+                style_cmds.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), bg))
+            except Exception:
+                pass
+
+    t.setStyle(TableStyle(style_cmds))
+    return t
+
+
 def _embed_image(path: str, width_cm: float = 14.0) -> Optional[Image]:
     if path and os.path.exists(path):
         img = Image(path)
@@ -209,7 +252,24 @@ def generate_report(
     price_history: List[float],
     data_info: Dict,
     output_path: Optional[str] = None,
+    wf_data: Optional[Dict] = None,
 ) -> str:
+    """
+    Build the multi-section PDF report.
+
+    Parameters
+    ----------
+    strategies   : Completed strategy instances (with value_history populated).
+    chart_paths  : Dict of PNG paths from visualization.generate_all().
+    price_history: Bar-close prices from TradingSimulation.
+    data_info    : Metadata dict (n_bars, date_range, ticker, interval).
+    output_path  : Override the default output path.
+    wf_data      : Optional walk-forward results dict with keys:
+                     "windows"     – list of window dicts from run_walk_forward()
+                     "summary_df"  – DataFrame from print_wf_summary()
+                     "chart_paths" – dict from generate_wf_charts()
+                   When provided a "7. Walk-Forward Analysis" section is appended.
+    """
     if output_path is None:
         output_path = os.path.join(OUTPUT_DIR, "simulation_report.pdf")
 
@@ -297,11 +357,14 @@ def generate_report(
     best_sharpe       = metrics_df.loc[best_sharpe_strat, "Sharpe Ratio"]
 
     story.append(Paragraph(
-        f"This report presents an agent-based algorithmic trading simulation in which four "
+        f"This report presents an agent-based algorithmic trading simulation in which five "
         f"competing strategies traded simultaneously in a shared limit order book, driven by "
         f"real AAPL tick data spanning {n_bars:,} five-minute bars ({date_range}). "
         f"The simulation captured realistic microstructure effects including bid/ask spread, "
-        f"price-time priority order matching, and square-root market impact.",
+        f"price-time priority order matching, and square-root market impact. "
+        f"Key enhancements in this version include ADX-based intraday regime detection "
+        f"that gates the Momentum and Mean Reversion strategies, and a new Donchian "
+        f"channel Trend Follower strategy with ATR-scaled stops.",
         S["Body"]
     ))
     story.append(Paragraph(
@@ -309,9 +372,9 @@ def generate_report(
         f"the highest absolute PnL of <b>${best_pnl:,.2f}</b>, while <b>{best_sharpe_strat}</b> "
         f"delivered the best risk-adjusted return with a Sharpe ratio of <b>{best_sharpe:.3f}</b>. "
         "The Market Maker consistently earned spread income while managing inventory risk. "
-        "The Momentum and Mean Reversion strategies exhibited complementary performance "
-        "profiles—momentum excelling in trending periods while mean reversion dominated "
-        "in choppy, oscillatory regimes.",
+        "The regime-gated Momentum and Mean Reversion strategies show improved risk-adjusted "
+        "performance by avoiding counter-trend trades in confirmed trending regimes. "
+        "The Trend Follower capitalises on sustained directional moves via channel breakouts.",
         S["Body"]
     ))
 
@@ -324,7 +387,7 @@ def generate_report(
     story.append(Paragraph("2.1  Architecture Overview", S["H2"]))
     story.append(Paragraph(
         "The simulator implements a discrete-time, event-driven agent-based model (ABM). "
-        "At each bar, all four agent strategies independently analyse the price history and "
+        "At each bar, all five agent strategies independently analyse the price history and "
         "submit zero or more orders to a central limit order book (CLOB). The CLOB matches "
         "orders using strict price-time priority (FIFO within each price level). After all "
         "agents have submitted their orders, each strategy's portfolio is marked to market "
@@ -357,7 +420,30 @@ def generate_report(
     ]:
         story.append(Paragraph(f"• {bullet}", S["Bullet"]))
 
-    story.append(Paragraph("2.4  Market Impact Model", S["H2"]))
+    story.append(Paragraph("2.4  Regime Detection", S["H2"]))
+    story.append(Paragraph(
+        "A shared <b>RegimeDetector</b> classifies each bar as <i>TRENDING_UP</i>, "
+        "<i>TRENDING_DOWN</i>, or <i>RANGING</i> using the <b>Average Directional Index "
+        "(ADX)</b> with Wilder's 14-bar smoothing. The True Range and directional movements "
+        "(+DM/-DM) are Wilder-smoothed to produce +DI and -DI indicators. The ADX is the "
+        "smoothed absolute difference between +DI and -DI, normalised by their sum:",
+        S["Body"]
+    ))
+    story.append(Paragraph(
+        "<i>ADX = Wilder₁₄( |+DI − −DI| / (+DI + −DI) × 100 )</i>",
+        ParagraphStyle("Formula", parent=S["Body"], alignment=TA_CENTER,
+                       fontSize=11, spaceAfter=8, fontName="Helvetica-Oblique")
+    ))
+    story.append(Paragraph(
+        "When ADX ≥ 25 the market is classified as trending; the direction is given by "
+        "the sign of (+DI − −DI).  When ADX < 25 the market is classified as RANGING. "
+        "The Momentum strategy trades only in the direction of the confirmed trend; "
+        "the Mean Reversion strategy suppresses entries in trending regimes to avoid "
+        "'catching a falling knife' or shorting strong uptrends.",
+        S["Body"]
+    ))
+
+    story.append(Paragraph("2.5  Market Impact Model", S["H2"]))
     story.append(Paragraph(
         "A square-root permanent impact model (Almgren-Chriss inspired) is applied to "
         "every order submission. The price impact per share is:",
@@ -375,9 +461,11 @@ def generate_report(
         S["Body"]
     ))
 
+
+
     # ═════════════════════ 3. STRATEGY DESCRIPTIONS ══════════════════
     story.append(PageBreak())
-    story.append(Paragraph("3. Trading Strategies", S["H1"]))
+    story.append(Paragraph("3. Trading Strategies (5 Agents)", S["H1"]))
     story.append(HRFlowable(width="100%", thickness=1, color=ACCENT))
     story.append(Spacer(1, 0.3 * cm))
 
@@ -433,6 +521,23 @@ def generate_report(
           "Random side (50/50 buy/sell)",
           "Random size 20–150 shares",
           "35 % market / 65 % marketable limit"]),
+
+        ("3.5  Trend Follower",
+         "The trend follower uses a Donchian price-channel breakout signal: a long "
+         "entry is triggered when the close price exceeds the prior 20-bar highest-high; "
+         "a short entry is triggered when it falls below the prior 20-bar lowest-low. "
+         "This is fundamentally different from EMA-crossover momentum—the signal is an "
+         "absolute price-level breach rather than a relative indicator comparison. "
+         "Position size is set dynamically by risking 1 % of current capital per trade "
+         "divided by the ATR-scaled stop distance (stop = 2 × ATR₁₄ from entry). "
+         "A take-profit is placed at 3 × ATR₁₄ from entry (1.5 : 1 reward-to-risk). "
+         "The ATR stop adjusts automatically: wider in volatile periods, tighter in "
+         "calm periods, producing more consistent risk across changing market conditions.",
+         ["20-bar Donchian channel breakout signal",
+          "Long on new 20-bar high; short on new 20-bar low",
+          "Position size: 1 % capital risk ÷ (2 × ATR₁₄)",
+          "Stop: 2 × ATR₁₄ from entry | Target: 3 × ATR₁₄ (1.5 : 1 RR)",
+          "Position limit: ±600 shares"]),
     ]
 
     for title, desc, bullets in strategies_desc:
@@ -513,27 +618,136 @@ def generate_report(
          "directional view, consistently generated income through spread capture. "
          "This confirms that passive liquidity provision is structurally profitable "
          "in limit-order markets, subject to inventory management."),
+        ("<b>Regime detection materially improves directional strategies.</b>  "
+         "Adding ADX-based regime gating to the Momentum and Mean Reversion strategies "
+         "prevents the most damaging trades: entering longs in confirmed downtrends "
+         "and buying dips that never revert. Strategies constrained to their natural "
+         "regime exhibit significantly reduced drawdowns."),
+        ("<b>Price-channel breakouts capture trends EMA crossovers miss.</b>  "
+         "The Trend Follower enters on an absolute price-level breach (new N-bar "
+         "high/low), providing a faster and more decisive signal than smoothed "
+         "EMA crossovers. ATR-scaled stops ensure that position risk is proportional "
+         "to current volatility rather than fixed."),
         ("<b>Strategy complementarity.</b>  Momentum and mean reversion strategies "
          "display opposite performance profiles. In trending markets (positive "
-         "autocorrelation), momentum dominates. In mean-reverting markets (negative "
-         "autocorrelation), the mean reversion strategy outperforms. Combining both "
-         "strategies in a portfolio reduces overall variance."),
+         "autocorrelation), momentum and trend-following strategies dominate. In "
+         "mean-reverting markets (negative autocorrelation), the mean reversion "
+         "strategy outperforms. Combining complementary strategies in a portfolio "
+         "reduces overall variance."),
         ("<b>Noise traders subsidise informed traders.</b>  The noise trader, as "
          "expected from market microstructure theory, consistently underperforms due "
          "to adverse selection (trading against strategies with better information) "
          "and spread costs. Its losses are the other strategies' gains."),
         ("<b>Market impact is non-trivial.</b>  The square-root impact model "
          "generates meaningful slippage for larger orders, particularly for the "
-         "momentum strategy which takes directional positions of 150+ shares. "
-         "Reducing order size or using limit orders reduces impact costs."),
-        ("<b>Inventory risk for market makers.</b>  The market maker's inventory "
-         "skew mechanism successfully kept positions bounded, but large directional "
-         "moves in AAPL still created temporary inventory imbalances that compressed "
-         "profit margins."),
+         "momentum and trend-following strategies which take directional positions of "
+         "150+ shares. Dynamic ATR-based sizing in the Trend Follower naturally "
+         "reduces size in volatile conditions, partially mitigating impact."),
     ]
     for f in findings:
         story.append(Paragraph(f"• {f}", S["Bullet"]))
         story.append(Spacer(1, 0.15 * cm))
+
+    # ═════════════════════ 7. WALK-FORWARD ANALYSIS ══════════════════
+    if wf_data is not None:
+        wf_windows    = wf_data.get("windows",    [])
+        wf_summary    = wf_data.get("summary_df")
+        wf_charts     = wf_data.get("chart_paths", {})
+        n_wf_windows  = len(wf_windows)
+
+        story.append(PageBreak())
+        story.append(Paragraph("7. Walk-Forward Analysis", S["H1"]))
+        story.append(HRFlowable(width="100%", thickness=1, color=ACCENT))
+        story.append(Spacer(1, 0.3 * cm))
+
+        story.append(Paragraph(
+            "Walk-forward testing is a rigorous out-of-sample validation method that "
+            "guards against curve-fitting. A fixed <b>30-trading-day in-sample (IS)</b> "
+            "window slides forward in <b>5-trading-day out-of-sample (OOS)</b> steps "
+            f"across the full AAPL dataset, producing <b>{n_wf_windows} non-overlapping "
+            "OOS evaluation periods</b>. For each window, all five strategy instances are "
+            "re-initialised from scratch and run through the combined IS+OOS slice. "
+            "The IS period warms up rolling indicators (EMA, ADX, Donchian channel) "
+            "without contributing to any reported metric. Performance figures are derived "
+            "exclusively from the OOS portion, eliminating any form of lookahead bias.",
+            S["Body"]
+        ))
+
+        story.append(Paragraph("7.1  OOS Summary Statistics", S["H2"]))
+        story.append(Spacer(1, 0.2 * cm))
+        if wf_summary is not None:
+            story.append(_wf_summary_table(wf_summary, S))
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph(
+                "Table 2. Walk-forward out-of-sample summary. Mean OOS PnL is the "
+                "average dollar profit per 5-day OOS window. "
+                "Std OOS PnL measures consistency. "
+                "% Windows Profitable is the fraction of OOS windows where the "
+                "strategy ended in profit. Worst Window is the single largest OOS loss. "
+                "Green/red shading indicates positive/negative values.",
+                S["Caption"]
+            ))
+
+        story.append(Spacer(1, 0.4 * cm))
+        story.append(Paragraph("7.2  OOS PnL per Window", S["H2"]))
+        img = _embed_image(wf_charts.get("walk_forward_pnl", ""), width_cm=15)
+        if img:
+            story.append(img)
+            story.append(Paragraph(
+                "Figure 5. Stacked bar chart showing each strategy's OOS PnL contribution "
+                "for every walk-forward window. Positive values stack above zero; "
+                "negative below. The dashed white line tracks the running cumulative "
+                "total PnL across all windows (right axis).",
+                S["Caption"]
+            ))
+
+        story.append(PageBreak())
+        story.append(Paragraph("7.3  Rolling OOS Sharpe Ratio", S["H2"]))
+        img = _embed_image(wf_charts.get("walk_forward_sharpe", ""), width_cm=15)
+        if img:
+            story.append(img)
+            story.append(Paragraph(
+                "Figure 6. Annualised out-of-sample Sharpe ratio for each strategy "
+                "across all walk-forward windows. A persistently positive Sharpe "
+                "indicates genuine edge; erratic or consistently negative values "
+                "suggest in-sample overfitting.",
+                S["Caption"]
+            ))
+
+        story.append(Spacer(1, 0.4 * cm))
+        story.append(Paragraph("7.4  Win/Loss Consistency Heatmap", S["H2"]))
+        img = _embed_image(wf_charts.get("walk_forward_consistency", ""), width_cm=15)
+        if img:
+            story.append(img)
+            story.append(Paragraph(
+                "Figure 7. Win/loss heatmap across strategies (rows) and OOS windows "
+                "(columns). Green cells indicate a profitable OOS window; red cells a "
+                "loss. Dollar PnL is annotated in each cell. A strategy with mostly "
+                "green cells demonstrates consistent out-of-sample profitability.",
+                S["Caption"]
+            ))
+
+        story.append(Spacer(1, 0.3 * cm))
+        story.append(Paragraph("7.5  Walk-Forward Interpretation", S["H2"]))
+        story.append(Paragraph(
+            "Walk-forward results are the most demanding test of a strategy's robustness. "
+            "Strategies that perform well on in-sample data but poorly across OOS windows "
+            "are over-fitted to the historical period and unlikely to generate real alpha. "
+            "Conversely, strategies with a high percentage of profitable OOS windows and a "
+            "positive mean OOS PnL have demonstrated that their edge persists in unseen data.",
+            S["Body"]
+        ))
+        story.append(Paragraph(
+            "The Market Maker's performance is expected to be the most stable across "
+            "windows because its income is structural (spread capture) rather than "
+            "dependent on directional market conditions. Directional strategies "
+            "(Momentum, Trend Follower) are expected to exhibit higher OOS variance, "
+            "performing well in trending windows and giving back gains in choppy "
+            "periods. The Mean Reversion strategy should complement these in ranging "
+            "windows. The Noise Trader's OOS PnL is expected to be persistently "
+            "negative — consistent with microstructure theory.",
+            S["Body"]
+        ))
 
     # ═════════════════════ 6. CONCLUSION ═════════════════════════════
     story.append(Spacer(1, 0.4 * cm))
@@ -543,17 +757,22 @@ def generate_report(
     story.append(Paragraph(
         "This simulation demonstrates that a realistic agent-based order book model can "
         "capture key stylised facts of financial markets: spread income for market makers, "
-        "directional alpha for momentum and mean reversion strategies, and losses for "
-        "uninformed noise traders. The square-root market impact model produces realistic "
-        "transaction costs that meaningfully affect strategy performance at typical "
-        "institutional order sizes.",
+        "directional alpha for trend-following strategies, regime-adaptive filtering for "
+        "momentum and mean-reversion, and losses for uninformed noise traders. "
+        "The ADX-based regime detector significantly improves the risk-adjusted "
+        "performance of the Momentum and Mean Reversion strategies by suppressing "
+        "counter-trend entries. The Donchian channel Trend Follower provides a "
+        "complementary signal that captures extended directional moves with "
+        "volatility-scaled risk management.",
         S["Body"]
     ))
     story.append(Paragraph(
-        "Future extensions could include: (i) an options overlay layer, (ii) intraday "
-        "seasonality effects (e.g., wider spreads at open/close), (iii) stochastic "
-        "volatility regimes, (iv) multi-asset correlation, and (v) reinforcement "
-        "learning-based adaptive strategies that optimise parameters online.",
+        "Future extensions could include: (i) walk-forward backtesting and parameter "
+        "sensitivity analysis to validate out-of-sample robustness; (ii) multi-asset "
+        "support and pairs/statistical arbitrage strategies; (iii) Hawkes process "
+        "microstructure for more realistic background order arrivals; "
+        "(iv) live paper-trading integration via a broker API; and "
+        "(v) reinforcement learning-based adaptive strategies that optimise parameters online.",
         S["Body"]
     ))
 

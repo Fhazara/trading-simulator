@@ -11,12 +11,24 @@ Logic
 • LONG  → exit  when |z| ≤ exit_z  OR  z ≥ entry_z (overshoot / stop)
 • SHORT → exit  when |z| ≤ exit_z  OR  z ≤ −entry_z (overshoot / stop)
 
-State machine uses the actual position (not a flag) so it cannot
-diverge from the order book's accounting even when limit orders fill
-across multiple bars or market orders partially execute.
+Regime gate (NEW)
+─────────────────
+• In RANGING       – normal operation (mean reversion is expected to work).
+• In TRENDING_UP   – skip new entries; close existing positions on neutral Z.
+                     Dips in uptrends continue lower; shorts are lethal.
+• In TRENDING_DOWN – skip new entries; close existing positions on neutral Z.
+                     Rallies in downtrends continue lower; longs are lethal.
+• In UNKNOWN       – original behaviour (warming up).
 
-Orders are cancelled-and-refreshed every bar so stale quotes are never
-left to fill at out-of-date prices.
+This prevents the strategy from "buying dips that didn't revert" during the
+$280 → $244 AAPL downtrend.
+
+State machine uses the actual position (not a flag) so it cannot diverge from
+the order book's accounting even when limit orders fill across multiple bars
+or market orders partially execute.
+
+Orders are cancelled-and-refreshed every bar so stale quotes are never left
+to fill at out-of-date prices.
 """
 
 from __future__ import annotations
@@ -28,6 +40,7 @@ import pandas as pd
 
 from .base import BaseStrategy, OrderSpec
 from order_book import Side, OrderType
+from regime import RegimeDetector, Regime
 
 if TYPE_CHECKING:
     from order_book import LimitOrderBook
@@ -35,7 +48,7 @@ if TYPE_CHECKING:
 
 class MeanReversionStrategy(BaseStrategy):
     """
-    Bollinger-band mean-reversion trader.
+    Bollinger-band mean-reversion trader with ADX regime gate.
 
     Parameters
     ----------
@@ -47,6 +60,10 @@ class MeanReversionStrategy(BaseStrategy):
         Z-score threshold to exit (reversion signal).
     trade_size : int
         Shares per signal.
+    adx_period : int
+        ADX period for the internal regime detector.
+    trend_thresh : float
+        ADX level above which a trend is confirmed (default 25).
     """
 
     def __init__(
@@ -59,12 +76,18 @@ class MeanReversionStrategy(BaseStrategy):
         entry_z: float = 1.5,
         exit_z: float = 0.4,
         trade_size: int = 120,
+        adx_period: int = 14,
+        trend_thresh: float = 25.0,
     ) -> None:
         super().__init__(trader_id, initial_capital, max_position, warmup)
-        self.lookback   = lookback
-        self.entry_z    = entry_z
-        self.exit_z     = exit_z
-        self.trade_size = trade_size
+        self.lookback    = lookback
+        self.entry_z     = entry_z
+        self.exit_z      = exit_z
+        self.trade_size  = trade_size
+        self._regime_detector = RegimeDetector(
+            adx_period=adx_period,
+            trend_thresh=trend_thresh,
+        )
 
     def generate_orders(
         self,
@@ -89,6 +112,15 @@ class MeanReversionStrategy(BaseStrategy):
 
         z = (mid - mu) / sigma
 
+        # ── regime gate ──────────────────────────────────────────────
+        regime = self._regime_detector.detect(prices, step)
+
+        # In a trending regime, new mean-reversion entries are suppressed:
+        # dips keep going lower in downtrends; rallies keep going higher in
+        # uptrends.  We still honour exits so we can get out of any position
+        # that was entered before the regime flipped.
+        allow_new_entry = regime in (Regime.RANGING, Regime.UNKNOWN)
+
         specs: List[OrderSpec] = []
         pos = int(round(self.position))
 
@@ -97,16 +129,22 @@ class MeanReversionStrategy(BaseStrategy):
             # Holding long: close when reverted toward mean or overshot
             if abs(z) <= self.exit_z or z >= self.entry_z:
                 specs.append(OrderSpec(Side.ASK, OrderType.MARKET, pos))
-            # Else: re-post limit bid at current level to add to position
-            # (only if we have room)
+            # In a trending regime with an open long, also close if we're
+            # not near entry z (i.e. we entered before regime flipped).
+            elif not allow_new_entry:
+                # Force close: don't hold longs in a downtrend
+                specs.append(OrderSpec(Side.ASK, OrderType.MARKET, pos))
 
         elif pos < 0:
             # Holding short: close when reverted toward mean or undershot
             if abs(z) <= self.exit_z or z <= -self.entry_z:
                 specs.append(OrderSpec(Side.BID, OrderType.MARKET, abs(pos)))
+            elif not allow_new_entry:
+                # Force close: don't hold shorts in an uptrend
+                specs.append(OrderSpec(Side.BID, OrderType.MARKET, abs(pos)))
 
-        else:
-            # Flat: look for fresh entry
+        elif allow_new_entry:
+            # Flat + regime allows entry: look for fresh signal
             if z <= -self.entry_z:
                 qty = min(self.trade_size, self.max_position)
                 if qty > 0:
